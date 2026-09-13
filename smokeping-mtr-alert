@@ -37,6 +37,7 @@ set -u
 
 PROG=${0##*/}
 DRY_RUN=''
+VERBOSE=''
 
 # Options passed to mtr, locally and on a remote probe alike.
 MTR_OPTS="-w --report -z --show-ips -c 20"
@@ -44,7 +45,7 @@ MTR_TIMEOUT=180
 
 usage() {
 	cat <<EOF
-usage: $PROG [-n] <alert> <target> <loss-pattern> <rtt-pattern> <hostname> [state]
+usage: $PROG [-n] [-v] <alert> <target> <loss-pattern> <rtt-pattern> <hostname> [state]
 
 Called by SmokePing as a pipe alert:
 
@@ -56,12 +57,14 @@ All settings come from the SmokePing configuration. Set SMOKEPING_CONFIG in the
 environment if it is not in one of the usual places.
 
   -n, --dry-run   print the message on stdout instead of sending it
+  -v, --verbose   report what was read from the config and how the mail was sent
   -h, --help      this text
 EOF
 }
 
 die() { echo "$PROG: $*" >&2; exit 1; }
 warn() { echo "$PROG: $*" >&2; }
+info() { [ -z "$VERBOSE" ] || echo "$PROG: $*" >&2; }
 
 # true when the argument is plain printable ASCII. Done with tr rather than a
 # [!\ -~] case pattern, which older shells refuse to parse.
@@ -75,6 +78,7 @@ esc() { printf '%s' "$1" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/
 while [ $# -gt 0 ]; do
 	case $1 in
 		-n|--dry-run) DRY_RUN=1 ;;
+		-v|--verbose) VERBOSE=1 ;;
 		-h|--help)    usage; exit 0 ;;
 		--)           shift; break ;;
 		-*)           usage >&2; die "unknown option: $1" ;;
@@ -88,6 +92,7 @@ done
 alert=$1 target=$2 loss=$3 rtt=$4 host=$5
 state=${6:-}
 
+info "$PROG starting for target $2"
 now=$(date +%s)
 localhost=$(hostname -f 2>/dev/null) || localhost=
 [ -n "$localhost" ] || localhost=$(uname -n)
@@ -302,6 +307,7 @@ done
 [ -n "$recipients" ] || recipients=$SP_CONTACT
 [ -n "$recipients" ] || die "no recipient: no mail address in Alerts/to, alertee or General/contact"
 
+info "config $CONFIG: recipients=$recipients mailhost=${SP_MAILHOST:-none} sendmail=${SP_SENDMAIL:-unset} datadir=${SP_DATADIR:-unset}"
 name=${SP_DISPLAY:-${SP_OWNER:-$localhost}}
 from_addr=${SP_FROM:-smokeping@$localhost}
 from_name=${SP_OWNER:-$SP_DISPLAY}
@@ -678,31 +684,49 @@ fi
 # General/mailhost is what SmokePing uses in place of a local MTA, so honour it
 # the same way; several comma separated hosts may be given.
 send_smtp() {
-	command -v curl >/dev/null 2>&1 || return 1
 	[ -n "$SP_MAILHOST" ] || return 1
+	if ! command -v curl >/dev/null 2>&1; then
+		warn "General/mailhost is set but curl is not installed, using a local MTA instead"
+		return 1
+	fi
+	# SMTP is a CRLF protocol and curl does not convert line endings, so a
+	# message written with bare LF can be mangled or refused by the server
+	smtpmsg="$tmp/message.smtp"
+	awk '{ printf "%s\r\n", $0 }' "$msg" > "$smtpmsg" || return 1
 	for h in $(printf '%s' "$SP_MAILHOST" | tr ',' ' '); do
 		set -- --silent --show-error --url "smtp://$h" \
-			--mail-from "$from_addr" --upload-file "$msg"
+			--mail-from "$from_addr" --upload-file "$smtpmsg"
 		for r in $(printf '%s' "$recipients" | tr ',' ' '); do
 			set -- "$@" --mail-rcpt "$r"
 		done
 		[ -n "$SP_MAILUSER" ] && set -- "$@" --user "$SP_MAILUSER:$SP_MAILPASS"
-		curl "$@" && return 0
+		if curl "$@"; then
+			info "delivered to $recipients over smtp via $h"
+			return 0
+		fi
 		warn "smtp delivery via $h failed"
 	done
 	return 1
 }
 
+# SmokePing prefers General/mailhost over a local MTA, so do the same
 send_smtp && exit 0
-[ -n "$SP_MAILHOST" ] && warn "falling back to a local MTA"
+[ -n "$SP_MAILHOST" ] && warn "no smtp host accepted the message, falling back to a local MTA"
 
 sendmail=$SP_SENDMAIL
-if [ -z "$sendmail" ] || [ ! -x "$sendmail" ]; then
-	for s in /usr/sbin/sendmail /usr/lib/sendmail; do
+if [ -n "$sendmail" ] && [ ! -x "$sendmail" ]; then
+	warn "General/sendmail is $sendmail, which is not executable; looking elsewhere"
+	sendmail=''
+fi
+if [ -z "$sendmail" ]; then
+	for s in /usr/sbin/sendmail /usr/lib/sendmail /usr/sbin/exim4 /usr/sbin/exim; do
 		[ -x "$s" ] && { sendmail=$s; break; }
 	done
-	[ -n "$sendmail" ] && [ -x "$sendmail" ] ||
-		sendmail=$(command -v sendmail) || die "no MTA found and no usable General/mailhost"
 fi
+[ -n "$sendmail" ] || sendmail=$(command -v sendmail) ||
+	die "no MTA found and no usable General/mailhost"
 
-"$sendmail" -t -oi < "$msg"
+info "handing the message to $sendmail for $recipients"
+"$sendmail" -f "$from_addr" -t -oi < "$msg" ||
+	die "$sendmail exited $? without accepting the message"
+info "accepted by $sendmail"
