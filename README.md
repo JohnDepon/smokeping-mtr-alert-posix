@@ -206,7 +206,7 @@ Header words that come out of the configuration are RFC 2047 encoded when they a
 The positional arguments are supplied by SmokePing itself.
 
 ```
-usage: smokeping-mtr-alert [-n] <alert> <target> <loss-pattern> <rtt-pattern> <hostname> [state]
+usage: smokeping-mtr-alert [-n] [-v] <alert> <target> <loss-pattern> <rtt-pattern> <hostname> [state]
 
 Called by SmokePing as a pipe alert:
 
@@ -218,6 +218,7 @@ All settings come from the SmokePing configuration. Set SMOKEPING_CONFIG in the
 environment if it is not in one of the usual places.
 
   -n, --dry-run   print the message on stdout instead of sending it
+  -v, --verbose   report what was read from the config and how the mail was sent
   -h, --help      this text
 ```
 
@@ -231,6 +232,8 @@ sudo -u smokeping /usr/local/bin/smokeping-mtr-alert -n \
 ```
 
 Drop `-n` to send it for real. The `X-SmokePing-Probe` and `X-SmokePing-RRD` headers show what the script worked out from the configuration, and warnings about anything it could not work out go to stderr, where SmokePing would discard them.
+
+`-v` adds a line for the config file it read, the recipients, the mail transport it chose and whether that transport accepted the message — the quickest way to find out where a message went when one does not arrive.
 
 ## Troubleshooting
 
@@ -251,6 +254,8 @@ Drop `-n` to send it for real. The `X-SmokePing-Probe` and `X-SmokePing-RRD` hea
 **`@define is not expanded`** — the script reads the configuration directly and does not implement Config::Grammar's `@define` macros. Values that depend on one will be read literally. Nothing else in the parse is affected.
 
 **A value looks like it has the comment glued onto it** (`failed to run command '/usr/bin/ssh # mandatory'`) — fixed; inline comments are stripped the way Config::Grammar strips them, from the first unescaped `#` to end of line, with `\#` kept as a literal `#`. Debian ships its probe templates with `binary = /usr/bin/fping # mandatory`, so this affects a stock install.
+
+**No mail at all, and the local MTA never sees it** — check `General/mailhost`. SmokePing prefers an SMTP host over a local MTA (`Net::SMTP` first, `sendmail` only in the `elsif`), and this script follows it, so with `mailhost` set the message never reaches Exim or Postfix and nothing appears in their logs. `-v` names the transport that was used. Note the same applies to SmokePing's own alert mails.
 
 **No mail at all** — SmokePing double-forks alert programs and their output follows SmokePing's own stderr, which is `/dev/null` once daemonised, so failures are invisible. Run the command by hand with `--dry-run` first, then check the MTA queue and logs. `to` must begin with `|` in the SmokePing config or the script is never called.
 
