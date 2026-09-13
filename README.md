@@ -250,6 +250,8 @@ Drop `-n` to send it for real. The `X-SmokePing-Probe` and `X-SmokePing-RRD` hea
 
 **`@define is not expanded`** — the script reads the configuration directly and does not implement Config::Grammar's `@define` macros. Values that depend on one will be read literally. Nothing else in the parse is affected.
 
+**A value looks like it has the comment glued onto it** (`failed to run command '/usr/bin/ssh # mandatory'`) — fixed; inline comments are stripped the way Config::Grammar strips them, from the first unescaped `#` to end of line, with `\#` kept as a literal `#`. Debian ships its probe templates with `binary = /usr/bin/fping # mandatory`, so this affects a stock install.
+
 **No mail at all** — SmokePing double-forks alert programs and their output follows SmokePing's own stderr, which is `/dev/null` once daemonised, so failures are invisible. Run the command by hand with `--dry-run` first, then check the MTA queue and logs. `to` must begin with `|` in the SmokePing config or the script is never called.
 
 **SELinux (EL)** — a confined SmokePing may be denied outbound mail, raw sockets or ssh. Check `ausearch -m avc -ts recent` before assuming the script is at fault.
