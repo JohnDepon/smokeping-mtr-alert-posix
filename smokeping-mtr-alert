@@ -63,6 +63,15 @@ EOF
 die() { echo "$PROG: $*" >&2; exit 1; }
 warn() { echo "$PROG: $*" >&2; }
 
+# true when the argument is plain printable ASCII. Done with tr rather than a
+# [!\ -~] case pattern, which older shells refuse to parse.
+is_ascii() {
+	[ -z "$(printf '%s' "$1" | LC_ALL=C tr -d ' -~')" ]
+}
+
+# minimal HTML escaping for text that goes into the HTML part
+esc() { printf '%s' "$1" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g'; }
+
 while [ $# -gt 0 ]; do
 	case $1 in
 		-n|--dry-run) DRY_RUN=1 ;;
@@ -129,8 +138,9 @@ flatten() {
 				esac
 			done
 			case $_i in /*) ;; *) _i="$_dir/$_i" ;; esac
+			_next=$((_d + 1))
 			# a subshell, so this file's own $_f and $_dir survive
-			( flatten "$_i" $((_d + 1)) )
+			( flatten "$_i" "$_next" )
 			;;
 		'@define '*)
 			warn "@define is not expanded by $PROG"
@@ -258,7 +268,7 @@ SP_PROBE_BINARY=${SP_PROBE_BINARY:-}
 recipients=''
 for a in $(printf '%s,%s,%s' "$SP_TO_ALL" "$SP_TO_ALERT" "$SP_ALERTEE" | tr ',' ' '); do
 	case $a in
-		\|*|snpp:*|xmpp:*|'') continue ;;
+		'|'*|'snpp:'*|'xmpp:'*|'') continue ;;
 		*@*) ;;
 		*) continue ;;
 	esac
@@ -294,11 +304,12 @@ start=$((now - window))
 rrd='' suffix=''
 if [ -n "$SP_DATADIR" ]; then
 	base="$SP_DATADIR/$(printf '%s' "$path" | tr . /)"
-	for c in ${reporter:+"~$reporter"} ''; do
-		if [ -r "$base$c.rrd" ]; then
-			rrd="$base$c.rrd" suffix=$c
-			break
-		fi
+	candidates=".rrd"
+	[ -n "$reporter" ] && candidates="~$reporter.rrd $candidates"
+	for c in $candidates; do
+		[ -r "$base$c" ] || continue
+		rrd="$base$c" suffix=${c%.rrd}
+		break
 	done
 	if [ -z "$rrd" ]; then
 		# say what is actually in that directory, so a wrong datadir or
@@ -333,7 +344,7 @@ png="$tmp/graph.png"
 # packet loss of that sample.
 graph_rrd() {
 	[ -n "$rrd" ] || return 1
-	pings=$(rrdtool info "$rrd" 2>/dev/null |
+	pings=$("$RRDTOOL" info "$rrd" 2>/dev/null |
 		sed -n 's/^ds\[ping\([0-9][0-9]*\)\].*/\1/p' | sort -n | tail -n 1)
 	[ -n "$pings" ] || pings=$SP_PINGS
 
@@ -369,9 +380,10 @@ graph_rrd() {
 		n=${b%%:*} col=${b#*:}
 		[ "$n" -gt "$pings" ] && continue
 		[ "$n" -le "$last" ] && continue
+		nxt=$((last + 1))
 		if [ "$n" = 0 ]; then lbl=0
-		elif [ "$((last + 1))" = "$n" ]; then lbl=$n
-		else lbl="$((last + 1))-$n"
+		elif [ "$nxt" = "$n" ]; then lbl=$n
+		else lbl="$nxt-$n"
 		fi
 		set -- "$@" \
 			"CDEF:me$n=loss,$last,GT,loss,$n,LE,*,1,UNKN,IF,median,*" \
@@ -387,15 +399,35 @@ graph_rrd() {
 		'GPRINT:ploss:MAX:%.2lf %% max' \
 		'GPRINT:ploss:LAST:%.2lf %% now\l'
 
-	rrdtool graph "$@" >/dev/null
+	"$RRDTOOL" graph "$@" >/dev/null
 }
 
-b64=''
-if command -v rrdtool >/dev/null 2>&1 && graph_rrd && [ -s "$png" ]; then
+# SmokePing draws its graphs through the RRDs perl module, so the rrdtool
+# command line binary is not necessarily installed alongside it. Look past
+# PATH as well, since a daemon's PATH is often minimal.
+RRDTOOL=$(command -v rrdtool 2>/dev/null) || RRDTOOL=''
+if [ -z "$RRDTOOL" ]; then
+	for r in /usr/bin/rrdtool /usr/local/bin/rrdtool /usr/sbin/rrdtool \
+	         /usr/local/rrdtool/bin/rrdtool /opt/rrdtool/bin/rrdtool; do
+		[ -x "$r" ] && { RRDTOOL=$r; break; }
+	done
+fi
+
+b64='' why=''
+if [ -z "$RRDTOOL" ]; then
+	why="the rrdtool binary was not found (SmokePing itself only needs the RRDs perl module, so rrdtool may not be installed)"
+elif [ -z "$SP_DATADIR" ]; then
+	why="General/datadir is not set in $CONFIG"
+elif [ -z "$rrd" ]; then
+	why="no RRD found for $path, see the warning above"
+elif ! graph_rrd || [ ! -s "$png" ]; then
+	why="rrdtool graph produced nothing from $rrd"
+else
 	b64=$(base64 "$png" 2>/dev/null) ||
 	b64=$(openssl base64 -in "$png" 2>/dev/null) || b64=''
+	[ -n "$b64" ] || why="neither base64 nor openssl could encode the PNG"
 fi
-[ -n "$b64" ] || warn "no graph embedded, sending text only"
+[ -n "$b64" ] || warn "no graph embedded, sending text only: $why"
 
 # --------------------------------------------------------------------- mtr ---
 
@@ -470,22 +502,23 @@ export LC_ALL
 # RFC 2047 for the header words that come out of the config and may not be
 # ASCII - a non-ASCII owner would otherwise corrupt the header
 mimeword() {
-	case $1 in
-		*[!\ -~]*) printf '=?UTF-8?B?%s?=' "$(printf '%s' "$1" | base64 | tr -d '\n')" ;;
-		*) printf '%s' "$1" ;;
-	esac
+	if is_ascii "$1"; then
+		printf '%s' "$1"
+	else
+		printf '=?UTF-8?B?%s?=' "$(printf '%s' "$1" | base64 | tr -d '\n')"
+	fi
 }
 subject=$(mimeword "$subject")
-if [ -n "$from_name" ]; then
-	case $from_name in
-		*[!\ -~]*) from="$(mimeword "$from_name") <$from_addr>" ;;
-		*) from="\"$(printf '%s' "$from_name" | sed 's/[\\"]/\\&/g')\" <$from_addr>" ;;
-	esac
-else
+if [ -z "$from_name" ]; then
 	from=$from_addr
+elif is_ascii "$from_name"; then
+	from="\"$(printf '%s' "$from_name" | sed 's/[\\"]/\\&/g')\" <$from_addr>"
+else
+	from="$(mimeword "$from_name") <$from_addr>"
 fi
 
-text="Packet loss report from $name for $target at $(date '+%c').
+stamp=$(date '+%c')
+text="Packet loss report from $name for $target at $stamp.
 Measured by: $measured_by"
 [ -n "$url" ] && text="$text
 
@@ -505,18 +538,26 @@ Target hostname: $host
 Loss pattern: ${loss#* }
 RTT: ${rtt#* }$state_line"
 
+extra_headers=''
+if [ -n "$SP_PROBE" ]; then
+	extra_headers="
+X-SmokePing-Probe: $SP_PROBE"
+	[ -n "$SP_PROBE_RHOST" ] && extra_headers="$extra_headers on $SP_PROBE_RHOST"
+fi
+[ -n "$rrd" ] && extra_headers="$extra_headers
+X-SmokePing-RRD: $rrd"
+
+date_hdr=$(date '+%a, %d %b %Y %H:%M:%S %z')
 headers="From: $from
 To: $recipients
 Subject: $subject
-Date: $(date '+%a, %d %b %Y %H:%M:%S %z')
+Date: $date_hdr
 Message-ID: <$now.$$@$localhost>
 MIME-Version: 1.0
 Auto-Submitted: auto-generated
 Precedence: bulk
 X-SmokePing-Alert: $alert
-X-SmokePing-Target: $target${SP_PROBE:+
-X-SmokePing-Probe: $SP_PROBE${SP_PROBE_RHOST:+ on $SP_PROBE_RHOST}}${rrd:+
-X-SmokePing-RRD: $rrd}"
+X-SmokePing-Target: $target$extra_headers"
 
 msg="$tmp/message"
 
@@ -531,21 +572,34 @@ EOF
 else
 	# multipart/related, so the graph is shown inline rather than as an
 	# attachment, wrapping a multipart/alternative for text only clients
-	esc() { sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g'; }
 	rel="=_rel_${now}_$$" alt="=_alt_${now}_$$" cid="graph.${now}.$$@$localhost"
 
-	# built here rather than inline below: quotes inside a ${var:+...} are
-	# eaten by quote removal, which would leave bare href= attributes.
-	# The link text is the URL itself, so it stays clickable without hiding
-	# the address behind a caption.
+	# everything is escaped into a variable up here, so the heredoc below is
+	# a plain template: no command substitution and no ${var:+...} inside it,
+	# both of which behave badly in a heredoc on older shells
+	e_name=$(esc "$name")
+	e_target=$(esc "$target")
+	e_measured=$(esc "$measured_by")
+	e_command=$(esc "$mtr_command")
+	e_output=$(esc "$mtr_output")
+	e_alert=$(esc "$alert")
+	e_host=$(esc "$host")
+	e_loss=$(esc "${loss#* }")
+	e_rtt=$(esc "${rtt#* }")
+	e_state=$(esc "$state_line")
+
 	html_img="<img src=\"cid:$cid\" alt=\"SmokePing graph\" style=\"max-width:100%;border:0\">"
+	# the link text is the URL itself, so it stays clickable without hiding
+	# the address behind a caption
 	html_link=''
 	if [ -n "$url" ]; then
-		u=$(printf '%s' "$url" | esc)
+		u=$(esc "$url")
 		html_link="<p><a href=\"$u\">$u</a></p>"
 	fi
 	html_note=''
-	[ -n "$mtr_note" ] && html_note="<p><b>$(printf '%s' "$mtr_note" | esc)</b></p>"
+	if [ -n "$mtr_note" ]; then
+		html_note="<p><b>$(esc "$mtr_note")</b></p>"
+	fi
 
 	cat > "$msg" <<EOF
 $headers
@@ -565,20 +619,20 @@ Content-Type: text/html; charset=UTF-8
 Content-Transfer-Encoding: 8bit
 
 <html><body style="font-family:sans-serif">
-<p>Packet loss report from <b>$(printf '%s' "$name" | esc)</b> for
-<b>$(printf '%s' "$target" | esc)</b> at $(date '+%c').<br>
-Measured by: $(printf '%s' "$measured_by" | esc)</p>
+<p>Packet loss report from <b>$e_name</b> for
+<b>$e_target</b> at $stamp.<br>
+Measured by: $e_measured</p>
 $html_link
 <p>$html_img</p>
 $html_note
-<pre style="font-size:small">$(printf '%s' "$mtr_command" | esc)
+<pre style="font-size:small">$e_command
 
-$(printf '%s' "$mtr_output" | esc)</pre>
-<pre style="font-size:small">Alert triggered: $(printf '%s' "$alert" | esc)
-Target: $(printf '%s' "$target" | esc)
-Target hostname: $(printf '%s' "$host" | esc)
-Loss pattern: $(printf '%s' "${loss#* }" | esc)
-RTT: $(printf '%s' "${rtt#* }" | esc)$(printf '%s' "$state_line" | esc)</pre>
+$e_output</pre>
+<pre style="font-size:small">Alert triggered: $e_alert
+Target: $e_target
+Target hostname: $e_host
+Loss pattern: $e_loss
+RTT: $e_rtt$e_state</pre>
 </body></html>
 
 --$alt--
