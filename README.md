@@ -77,6 +77,8 @@ alerts = someloss
 
 `edgetrigger = yes` is supported: SmokePing then passes a sixth argument (`1` on raise, `0` on clear), the subject becomes `... alert raised:` or `... alert cleared:`, and a `State:` line is added to the body.
 
+SmokePing 2.6.x builds that argument as `($what =~ /raise/)`, which is an empty list when the match fails, so on clear it passes **no** sixth argument rather than `0`. The script therefore reads `edgetrigger` from the configuration (the alert's own, else the one inherited from `*** Alerts ***`) and treats a missing sixth argument on an edge-triggered alert as a clear.
+
 More information about the alerting syntax is available [in the SmokePing documentation](https://oss.oetiker.ch/smokeping/doc/smokeping_config.en.html#___top).
 
 ## Where each setting comes from
@@ -231,7 +233,7 @@ sudo -u smokeping /usr/local/bin/smokeping-mtr-alert -n \
   someloss Backbone.Router1 "loss: 0%, 0%, 100%" "rtt: 12ms, 13ms, U" 192.0.2.1
 ```
 
-Drop `-n` to send it for real. The `X-SmokePing-Probe` and `X-SmokePing-RRD` headers show what the script worked out from the configuration, and warnings about anything it could not work out go to stderr, where SmokePing would discard them.
+If the alert has `edgetrigger = yes`, those five arguments are what SmokePing 2.6.x sends on a clear, so the message comes out as `alert cleared:`; append `1` to see a raise. Drop `-n` to send it for real. The `X-SmokePing-Probe` and `X-SmokePing-RRD` headers show what the script worked out from the configuration, and warnings about anything it could not work out go to stderr, where SmokePing would discard them.
 
 `-v` adds a line for the config file it read, the recipients, the mail transport it chose and whether that transport accepted the message — the quickest way to find out where a message went when one does not arrive.
 

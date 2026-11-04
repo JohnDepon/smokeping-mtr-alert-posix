@@ -16,7 +16,8 @@
 # has "edgetrigger = yes"):
 #
 #   1 name-of-alert   2 target   3 loss-pattern   4 rtt-pattern   5 hostname
-#   6 state           (1 = raised, 0 = cleared; only with edgetrigger = yes)
+#   6 state           (1 = raised, 0 = cleared; only with edgetrigger = yes,
+#                     and SmokePing 2.6.x omits it entirely on clear)
 #
 # Argument 2 is the dotted target path SmokePing itself puts in "?target=" when
 # it sends its own alert mail, so the graph URL, the RRD and the probe that
@@ -233,7 +234,9 @@ BEGIN { nparts = split(tpath, part, ".") }
 		else if (section == "Alerts") {
 			if (depth == 0 && k == "to")        emit("SP_TO_ALL", v)
 			else if (depth == 0 && k == "from") emit("SP_FROM", v)
+			else if (depth == 0 && k == "edgetrigger") emit("SP_EDGE_ALL", v)
 			else if (depth == 1 && pth[1] == alert && k == "to") emit("SP_TO_ALERT", v)
+			else if (depth == 1 && pth[1] == alert && k == "edgetrigger") emit("SP_EDGE_ALERT", v)
 		}
 		else if (section == "Targets" && onpath()) {
 			if (k == "alertee")    emit("SP_ALERTEE", v)
@@ -288,6 +291,15 @@ SP_WIDTH=${SP_WIDTH:-600} SP_HEIGHT=${SP_HEIGHT:-200} SP_RANGE=${SP_RANGE:-3h}
 SP_PROBE=${SP_PROBE:-} SP_PROBE_RHOST=${SP_PROBE_RHOST:-}
 SP_PROBE_RUSER=${SP_PROBE_RUSER:-} SP_PROBE_RPORT=${SP_PROBE_RPORT:-}
 SP_PROBE_BINARY=${SP_PROBE_BINARY:-}
+SP_EDGE_ALL=${SP_EDGE_ALL:-} SP_EDGE_ALERT=${SP_EDGE_ALERT:-}
+
+# SmokePing up to 2.6.x passes the state as ($what =~ /raise/), which in list
+# context is (1) on raise but an empty list on clear: no 6th argument at all.
+# So when the alert is edge triggered (its own setting, else inherited from
+# the Alerts section), a missing state means the alert was cleared.
+if [ -z "$state" ] && [ "${SP_EDGE_ALERT:-$SP_EDGE_ALL}" = yes ]; then
+	state=0
+fi
 
 # --------------------------------------------------------------- recipients ---
 
